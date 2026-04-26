@@ -72,3 +72,4 @@ build/
 samples/
 *.xmp
 DEV_LOG.md
+.photo_exif_cache.db
