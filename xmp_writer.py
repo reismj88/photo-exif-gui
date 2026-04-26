@@ -4,6 +4,9 @@ from typing import Optional
 import xml.etree.ElementTree as ET
 
 
+_EXIFGUI_NS = "https://ns.photo-exif-gui/1.0/"
+
+
 @dataclass
 class XMPData:
     title: str = ""
@@ -11,6 +14,7 @@ class XMPData:
     keywords: list[str] = field(default_factory=list)
     copyright: str = ""
     rating: int = 0  # 0 = unrated, 1-5
+    sharpness_score: Optional[int] = None
 
 
 def _register_namespaces() -> None:
@@ -18,6 +22,7 @@ def _register_namespaces() -> None:
     ET.register_namespace("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
     ET.register_namespace("dc", "http://purl.org/dc/elements/1.1/")
     ET.register_namespace("xmp", "http://ns.adobe.com/xap/1.0/")
+    ET.register_namespace("exifgui", _EXIFGUI_NS)
 
 
 def _lang_alt(parent: ET.Element, tag: str, value: str) -> None:
@@ -55,6 +60,10 @@ def build_xmp_xml(data: XMPData) -> str:
     if data.rating > 0:
         rating_el = ET.SubElement(desc, "{http://ns.adobe.com/xap/1.0/}Rating")
         rating_el.text = str(data.rating)
+
+    if data.sharpness_score is not None:
+        score_el = ET.SubElement(desc, f"{{{_EXIFGUI_NS}}}SharpnessScore")
+        score_el.text = str(data.sharpness_score)
 
     ET.indent(xmpmeta, space="  ")
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(xmpmeta, encoding="unicode")

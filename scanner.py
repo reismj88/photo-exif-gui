@@ -6,6 +6,11 @@ import exifread
 
 SUPPORTED_EXTENSIONS = {".nef", ".jpg", ".jpeg", ".tiff", ".tif", ".cr2", ".arw", ".dng"}
 
+_SCANNER_STRINGS = frozenset({
+    "noritsu", "koki", "epson", "plustek", "coolscan", "canoscan",
+    "vuescan", "silverfast", "opticfilm", "fujifilm frontier", "scan",
+})
+
 EXPOSURE_MODES = {0: "Auto", 1: "Manual", 2: "Auto Bracket"}
 METERING_MODES = {
     0: "Unknown", 1: "Average", 2: "Center-weighted", 3: "Spot",
@@ -36,8 +41,12 @@ class PhotoRecord:
     width: Optional[int] = None
     height: Optional[int] = None
     white_balance: Optional[str] = None
+    software: Optional[str] = None
     missing_exif: bool = False
     xmp_exists: bool = False
+    sharpness_score: Optional[int] = None
+    sharpness_type: Optional[str] = None
+    sharpness_has_people: Optional[bool] = None
 
     @property
     def camera(self) -> str:
@@ -131,6 +140,7 @@ def extract_exif(path: Path) -> PhotoRecord:
 
         record.camera_make = _tag_str(tags, "Image Make")
         record.camera_model = _tag_str(tags, "Image Model")
+        record.software = _tag_str(tags, "Image Software")
         record.lens_model = (
             _tag_str(tags, "EXIF LensModel")
             or _tag_str(tags, "MakerNote LensModel")
@@ -198,6 +208,20 @@ def extract_exif(path: Path) -> PhotoRecord:
         record.missing_exif = True
 
     return record
+
+
+def is_film_scan(record: PhotoRecord) -> bool:
+    """Return True if the record looks like a film scan rather than a digital capture."""
+    text = " ".join(
+        p for p in (record.camera_make, record.camera_model, record.software) if p
+    ).lower()
+    if any(s in text for s in _SCANNER_STRINGS):
+        return True
+    missing = sum(
+        1 for v in (record.aperture, record.shutter_speed, record.lens_model, record.focal_length)
+        if not v
+    )
+    return missing >= 3
 
 
 def scan_folder(folder: Path) -> list[PhotoRecord]:

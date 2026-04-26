@@ -9,13 +9,16 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QFileDialog, QProgressBar,
     QGroupBox, QFormLayout, QLineEdit, QPlainTextEdit,
     QSpinBox, QSplitter, QScrollArea, QGridLayout, QSizePolicy,
-    QFrame,
+    QFrame, QMessageBox,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from scanner import scan_folder, PhotoRecord, SUPPORTED_EXTENSIONS
 from xmp_writer import XMPData, write_xmp, read_xmp
+from analysis import AnalysisWorker
 import charts
+import config
+import vision
 
 RAW_EXTENSIONS = {".nef", ".cr2", ".arw", ".dng"}
 
@@ -37,8 +40,15 @@ COLUMNS = [
     ("Focus Mode",        lambda r: r.focus_mode or ""),
     ("GPS",               lambda r: r.gps_str),
     ("Dimensions",        lambda r: r.dimensions_str),
+    ("Sharpness",         lambda r: str(r.sharpness_score) if r.sharpness_score is not None else ""),
+    ("Type",              lambda r: r.sharpness_type or ""),
     ("XMP",               lambda r: "✓ XMP" if r.xmp_exists else "— None"),
 ]
+
+_COL = {name: i for i, (name, _) in enumerate(COLUMNS)}
+SHARPNESS_COL = _COL["Sharpness"]
+TYPE_COL      = _COL["Type"]
+XMP_COL       = _COL["XMP"]
 
 
 class _PreviewLabel(QLabel):
@@ -170,10 +180,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Photo EXIF Scanner")
         self.resize(1280, 820)
         self._records: list[PhotoRecord] = []
+        self._path_to_record: dict[str, PhotoRecord] = {}
         self._worker: ScanWorker | None = None
         self._preview_worker: PreviewWorker | None = None
         self._preview_generation: int = 0
         self._running_workers: set[PreviewWorker] = set()
+        self._analysis_worker: AnalysisWorker | None = None
+        self._analysis_running_workers: set[AnalysisWorker] = set()
         self._setup_ui()
 
     # ------------------------------------------------------------------ setup
@@ -192,6 +205,12 @@ class MainWindow(QMainWindow):
         self._progress.setMaximumHeight(6)
         self._progress.setTextVisible(False)
         vbox.addWidget(self._progress)
+
+        self._analysis_progress = QProgressBar()
+        self._analysis_progress.setVisible(False)
+        self._analysis_progress.setMaximumHeight(6)
+        self._analysis_progress.setTextVisible(False)
+        vbox.addWidget(self._analysis_progress)
 
         self._tabs = QTabWidget()
         vbox.addWidget(self._tabs, stretch=1)
@@ -222,6 +241,14 @@ class MainWindow(QMainWindow):
         self._btn_scan.setStyleSheet("QPushButton { font-weight: bold; padding: 4px 16px; }")
         self._btn_scan.clicked.connect(self._start_scan)
 
+        self._btn_analyze = QPushButton("Analyze Sharpness")
+        self._btn_analyze.setEnabled(False)
+        self._btn_analyze.clicked.connect(self._start_analysis)
+
+        self._btn_stop_analysis = QPushButton("Stop Analysis")
+        self._btn_stop_analysis.setVisible(False)
+        self._btn_stop_analysis.clicked.connect(self._stop_analysis)
+
         self._status_label = QLabel("")
         self._status_label.setStyleSheet("color: #888;")
 
@@ -229,6 +256,8 @@ class MainWindow(QMainWindow):
         hbox.addWidget(self._path_label)
         hbox.addWidget(self._status_label)
         hbox.addWidget(self._btn_scan)
+        hbox.addWidget(self._btn_analyze)
+        hbox.addWidget(self._btn_stop_analysis)
         return hbox
 
     def _build_table_widget(self) -> QWidget:
@@ -346,12 +375,18 @@ class MainWindow(QMainWindow):
     def _start_scan(self) -> None:
         if not hasattr(self, "_folder"):
             return
+        if self._analysis_worker is not None:
+            self._analysis_worker.cancel()
         self._btn_scan.setEnabled(False)
+        self._btn_analyze.setEnabled(False)
+        self._analysis_progress.setVisible(False)
+        self._btn_stop_analysis.setVisible(False)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._status_label.setText("Scanning…")
         self._table.setRowCount(0)
         self._records = []
+        self._path_to_record = {}
 
         self._worker = ScanWorker(self._folder)
         self._worker.progress.connect(self._on_progress)
@@ -366,10 +401,12 @@ class MainWindow(QMainWindow):
 
     def _on_scan_done(self, records: list[PhotoRecord]) -> None:
         self._records = records
+        self._path_to_record = {str(r.path): r for r in records}
         self._populate_table(records)
         self._update_summary(records)
         self._progress.setVisible(False)
         self._btn_scan.setEnabled(True)
+        self._btn_analyze.setEnabled(bool(records))
         missing = sum(1 for r in records if r.missing_exif)
         self._status_label.setText(
             f"{len(records)} images scanned  ·  {missing} missing EXIF"
@@ -378,13 +415,12 @@ class MainWindow(QMainWindow):
     def _populate_table(self, records: list[PhotoRecord]) -> None:
         self._table.setSortingEnabled(False)
         self._table.setRowCount(len(records))
-        xmp_col = len(COLUMNS) - 1
 
         for row, record in enumerate(records):
             for col, (_, getter) in enumerate(COLUMNS):
                 item = QTableWidgetItem(getter(record))
                 item.setData(Qt.ItemDataRole.UserRole, str(record.path))
-                if col == xmp_col and record.xmp_exists:
+                if col == XMP_COL and record.xmp_exists:
                     item.setForeground(QColor("#4a9eff"))
                 self._table.setItem(row, col, item)
 
@@ -462,20 +498,95 @@ class MainWindow(QMainWindow):
 
         if n == 1:
             path_str = self._table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+            record = self._path_to_record.get(path_str)
             existing = read_xmp(Path(path_str))
             if existing:
                 self._xmp_title.setText(existing.title)
                 self._xmp_caption.setPlainText(existing.caption)
                 self._xmp_keywords.setText(", ".join(existing.keywords))
                 self._xmp_copyright.setText(existing.copyright)
-                self._xmp_rating.setValue(existing.rating)
+                rating = existing.rating
+                if rating == 0 and record and record.sharpness_score is not None:
+                    rating = vision.score_to_stars(record.sharpness_score)
+                self._xmp_rating.setValue(rating)
                 return
 
         self._xmp_title.clear()
         self._xmp_caption.clear()
         self._xmp_keywords.clear()
         self._xmp_copyright.clear()
-        self._xmp_rating.setValue(0)
+        record = self._path_to_record.get(
+            self._table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        ) if n == 1 else None
+        self._xmp_rating.setValue(
+            vision.score_to_stars(record.sharpness_score)
+            if record and record.sharpness_score is not None else 0
+        )
+
+    def _start_analysis(self) -> None:
+        if not self._records or not hasattr(self, "_folder"):
+            return
+        self._btn_analyze.setEnabled(False)
+        self._btn_stop_analysis.setVisible(True)
+        self._analysis_progress.setVisible(True)
+        self._analysis_progress.setValue(0)
+        self._status_label.setText("Analyzing…")
+
+        worker = AnalysisWorker(self._records, self._folder)
+        worker.progress.connect(self._on_analysis_progress)
+        worker.image_done.connect(self._on_analysis_image_done)
+        worker.error.connect(self._on_analysis_error)
+        worker.finished.connect(lambda w=worker: self._analysis_running_workers.discard(w))
+        worker.finished.connect(self._on_analysis_finished)
+        self._analysis_running_workers.add(worker)
+        self._analysis_worker = worker
+        worker.start()
+
+    def _stop_analysis(self) -> None:
+        if self._analysis_worker is not None:
+            self._analysis_worker.cancel()
+
+    def _on_analysis_progress(self, current: int, total: int) -> None:
+        self._analysis_progress.setMaximum(total)
+        self._analysis_progress.setValue(current)
+        self._status_label.setText(f"Analyzing: {current} / {total} photos")
+
+    def _on_analysis_image_done(
+        self, path_str: str, score: int, _stars: int, sharpness_type: str, has_people: bool
+    ) -> None:
+        record = self._path_to_record.get(path_str)
+        if record is None:
+            return
+        record.sharpness_score = score
+        record.sharpness_type = sharpness_type
+        record.sharpness_has_people = has_people
+
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == path_str:
+                self._table.item(row, SHARPNESS_COL).setText(str(score))
+                self._table.item(row, TYPE_COL).setText(sharpness_type)
+                break
+
+    def _on_analysis_error(self, msg: str) -> None:
+        self._on_analysis_finished()
+        QMessageBox.critical(
+            self,
+            "Analysis Error",
+            f"{msg}\n\n"
+            f"Make sure Ollama is running:  ollama serve\n"
+            f"Pull the model if needed:     ollama pull {config.OLLAMA_MODEL}",
+        )
+
+    def _on_analysis_finished(self) -> None:
+        self._analysis_worker = None
+        self._btn_analyze.setEnabled(bool(self._records))
+        self._btn_stop_analysis.setVisible(False)
+        self._analysis_progress.setVisible(False)
+        analyzed = sum(1 for r in self._records if r.sharpness_score is not None)
+        self._status_label.setText(
+            f"Analysis complete — {analyzed} / {len(self._records)} images scored."
+        )
 
     def _write_xmp(self) -> None:
         rows = self._table.selectionModel().selectedRows()
@@ -490,19 +601,23 @@ class MainWindow(QMainWindow):
             rating=self._xmp_rating.value(),
         )
 
-        xmp_col = len(COLUMNS) - 1
         for idx in rows:
             row = idx.row()
             path_str = self._table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-            write_xmp(Path(path_str), data)
-            # refresh XMP status cell
-            item = self._table.item(row, xmp_col)
+            record = self._path_to_record.get(path_str)
+            write_xmp(Path(path_str), XMPData(
+                title=data.title,
+                caption=data.caption,
+                keywords=data.keywords,
+                copyright=data.copyright,
+                rating=data.rating,
+                sharpness_score=record.sharpness_score if record else None,
+            ))
+            item = self._table.item(row, XMP_COL)
             item.setText("✓ XMP")
             item.setForeground(QColor("#4a9eff"))
-            # update record in memory
-            for r in self._records:
-                if str(r.path) == path_str:
-                    r.xmp_exists = True
+            if record:
+                record.xmp_exists = True
 
         self._status_label.setText(f"XMP written for {len(rows)} image{'s' if len(rows) != 1 else ''}.")
 
