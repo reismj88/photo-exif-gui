@@ -312,3 +312,62 @@ Vision models return free text even when asked for a number. `re.search(r'\b(\d{
 - Sharpness score is not shown in the Summary tab charts
 - `is_film_scan` fingerprint check (≥3 missing fields) can misfire on heavily corrupted digital EXIF — no warning is surfaced to the user
 - SQLite cache is per-folder; if images are moved, the cache entries become orphaned (mtime key prevents stale hits, but the DB grows unbounded)
+
+---
+
+## Session 4 — 2026-04-26
+
+### Bug 5 — macOS major-version upgrade breaks all PyQt6 native extensions
+
+**Symptom:** App fails to launch with:
+```
+qt.qpa.plugin: Could not find the Qt platform plugin "cocoa" in ""
+This application failed to start because no Qt platform plugin could be initialized.
+```
+Followed by a Python crash report (`EXC_CRASH SIGABRT`, `abort() called`) with the stack:
+```
+QGuiApplicationPrivate::createPlatformIntegration()
+QGuiApplicationPrivate::createEventDispatcher()
+QCoreApplicationPrivate::init()
+QApplication::QApplication()
+```
+
+**Misleading investigation paths:**
+- `libqcocoa.dylib` is present at the correct path and loads fine in isolation via `ctypes.CDLL()`
+- `otool -l` shows correct rpath (`@loader_path/../../lib`) pointing to Qt framework dirs
+- `QT_DEBUG_PLUGINS=1` logs the correct search directory but does not log finding or rejecting any plugin — Qt aborts before emitting plugin-level diagnostics
+- Conda base environment is active but has no PyQt6 and sets no conflicting Qt env vars
+- The library binary appeared valid by every static check
+
+**Root cause:** macOS was upgraded from 13.2.1 (Ventura) to 26.4.1 between sessions. The crash report `"os_version": "macOS 26.4.1 (25E253)"` confirmed this. All compiled Python extension binaries in `.venv/` (PyQt6 `.so` files, `libqcocoa.dylib`, rawpy, numpy) were built against the macOS 13 SDK. On macOS 26, system frameworks changed enough that the pre-compiled plugin fails to initialize at the C++ level — causing Qt's `QMessageLogger::fatal()` → `abort()` before Python can catch anything.
+
+**Fix:**
+```bash
+.venv/bin/pip install --force-reinstall PyQt6 PyQt6-Qt6 PyQt6-sip rawpy numpy
+```
+pip pulls fresh wheels for the current OS. After reinstall:
+```
+.venv/bin/python -c "from PyQt6.QtWidgets import QApplication; import sys; app = QApplication(sys.argv); print('Qt OK:', app.platformName())"
+# Qt OK: cocoa
+```
+
+**Lesson:** When Qt platform plugin errors appear after an OS upgrade, the file-system checks (plugin present, rpath correct, ctypes load) are all irrelevant — the binary is ABI-incompatible. Force-reinstall all compiled packages immediately rather than debugging the dynamic linker. The debug signal is: `createPlatformIntegration()` → `fatal()` → `abort()` with no plugin-level log output.
+
+**Note on pip cache:** pip reused cached `.whl` files even with `--force-reinstall`. If wheels are stale, add `--no-cache-dir` to force fresh downloads.
+
+### Known issues / to-do
+
+### Bug 6 — Beachball / UI freeze during table population after scan
+
+**Symptom:** App became unresponsive (spinning beachball) immediately after the directory scan completed.
+
+**Root cause:** `_populate_table` called `self._table.resizeColumnsToContents()` after inserting all rows. Qt measures every cell in every row on the main thread to compute column widths — O(n × columns). For a folder with 300 photos × 20 columns, that's 6,000 text-width calculations blocking the event loop.
+
+**Fix:** Removed `resizeColumnsToContents()`. Replaced with explicit `setColumnWidth(i, w)` calls using fixed initial widths per column. Users can still drag column headers to resize.
+
+**Lesson:** `resizeColumnsToContents()` is fine for small tables but is a main-thread freeze for any dataset over ~100 rows. Always use fixed initial widths or `QHeaderView.ResizeMode.ResizeToContents` only on the header section (not data), then let users resize interactively.
+
+### Known issues / to-do
+
+- [ ] Verify the full app runs cleanly on macOS 26 after the reinstall (preview, analysis, XMP write)
+- [ ] Test Claude backend end-to-end (install `anthropic` package, run a small batch)

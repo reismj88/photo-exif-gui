@@ -424,7 +424,12 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor("#4a9eff"))
                 self._table.setItem(row, col, item)
 
-        self._table.resizeColumnsToContents()
+        _COL_WIDTHS = [
+            200, 140, 160, 200, 75, 65, 70, 80, 55,
+            90, 75, 85, 100, 50, 90, 120, 100, 75, 90, 65,
+        ]
+        for i, w in enumerate(_COL_WIDTHS):
+            self._table.setColumnWidth(i, w)
         self._table.setSortingEnabled(True)
 
     def _update_summary(self, records: list[PhotoRecord]) -> None:
