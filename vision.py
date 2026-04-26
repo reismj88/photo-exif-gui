@@ -83,12 +83,7 @@ def _ollama_request(prompt: str, image_bytes: bytes) -> str:
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read()).get("response", "")
     except urllib.error.URLError as exc:
-        raise ConnectionError(
-            f"Ollama unreachable at {config.OLLAMA_HOST}.\n"
-            f"Start it with:  ollama serve\n"
-            f"Pull the model: ollama pull {config.OLLAMA_MODEL}\n"
-            f"({exc})"
-        ) from exc
+        raise ConnectionError(str(exc)) from exc
 
 
 def _claude_request(prompt: str, image_bytes: bytes) -> str:

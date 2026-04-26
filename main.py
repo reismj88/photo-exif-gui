@@ -573,9 +573,9 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(
             self,
             "Analysis Error",
-            f"{msg}\n\n"
-            f"Make sure Ollama is running:  ollama serve\n"
-            f"Pull the model if needed:     ollama pull {config.OLLAMA_MODEL}",
+            f"Could not reach Ollama ({msg})\n\n"
+            f"1. Start Ollama:   ollama serve\n"
+            f"2. Pull the model: ollama pull {config.OLLAMA_MODEL}",
         )
 
     def _on_analysis_finished(self) -> None:
