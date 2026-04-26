@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -16,6 +16,8 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from scanner import scan_folder, PhotoRecord, SUPPORTED_EXTENSIONS
 from xmp_writer import XMPData, write_xmp, read_xmp
 import charts
+
+RAW_EXTENSIONS = {".nef", ".cr2", ".arw", ".dng"}
 
 COLUMNS = [
     ("File",              lambda r: r.path.name),
@@ -37,6 +39,87 @@ COLUMNS = [
     ("Dimensions",        lambda r: r.dimensions_str),
     ("XMP",               lambda r: "✓ XMP" if r.xmp_exists else "— None"),
 ]
+
+
+class _PreviewLabel(QLabel):
+    """QLabel that scales its pixmap to fill available space on resize."""
+
+    def __init__(self):
+        super().__init__()
+        self._source: QPixmap | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(100, 100)
+        self.setStyleSheet("background: #1a1a1a; border: 1px solid #3a3a3a;")
+
+    def set_source(self, pixmap: QPixmap) -> None:
+        self._source = pixmap
+        self._refresh()
+
+    def clear_source(self) -> None:
+        self._source = None
+        self.clear()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self._source is None:
+            return
+        scaled = self._source.scaled(
+            self.width(), self.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+class PreviewWorker(QThread):
+    loaded = pyqtSignal(QImage)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self._path = path
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        if self._cancelled:
+            return
+        try:
+            ext = self._path.suffix.lower()
+            if ext in RAW_EXTENSIONS:
+                import rawpy
+                with rawpy.imread(str(self._path)) as raw:
+                    thumb = raw.extract_thumb()
+                if self._cancelled:
+                    return
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    img = QImage()
+                    img.loadFromData(bytes(thumb.data))
+                else:
+                    arr = thumb.data
+                    h, w, ch = arr.shape
+                    img = QImage(
+                        arr.tobytes(), w, h, w * ch,
+                        QImage.Format.Format_RGB888,
+                    )
+                    img = img.copy()
+            else:
+                img = QImage(str(self._path))
+
+            if self._cancelled:
+                return
+            if img.isNull():
+                self.failed.emit(f"Could not load {self._path.name}")
+            else:
+                self.loaded.emit(img)
+        except Exception as e:
+            if not self._cancelled:
+                self.failed.emit(str(e))
 
 
 class ScanWorker(QThread):
@@ -88,6 +171,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
         self._records: list[PhotoRecord] = []
         self._worker: ScanWorker | None = None
+        self._preview_worker: PreviewWorker | None = None
+        self._preview_generation: int = 0
         self._setup_ui()
 
     # ------------------------------------------------------------------ setup
@@ -110,11 +195,16 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         vbox.addWidget(self._tabs, stretch=1)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self._build_table_widget())
-        splitter.addWidget(self._build_xmp_panel())
-        splitter.setSizes([600, 200])
-        self._tabs.addTab(splitter, "Table")
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        h_splitter.addWidget(self._build_table_widget())
+        h_splitter.addWidget(self._build_preview_panel())
+        h_splitter.setSizes([860, 400])
+
+        v_splitter = QSplitter(Qt.Orientation.Vertical)
+        v_splitter.addWidget(h_splitter)
+        v_splitter.addWidget(self._build_xmp_panel())
+        v_splitter.setSizes([600, 200])
+        self._tabs.addTab(v_splitter, "Table")
         self._tabs.addTab(self._build_summary_tab(), "Summary")
 
     def _build_toolbar(self) -> QHBoxLayout:
@@ -158,6 +248,25 @@ class MainWindow(QMainWindow):
 
         vbox.addWidget(self._table)
         return w
+
+    def _build_preview_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setMinimumWidth(180)
+        panel.setMaximumWidth(420)
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(4, 4, 4, 4)
+        vbox.setSpacing(4)
+
+        self._preview_img = _PreviewLabel()
+
+        self._preview_name = QLabel("Select a single image\nto preview")
+        self._preview_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_name.setStyleSheet("color: #888; font-size: 11px;")
+        self._preview_name.setMaximumHeight(36)
+
+        vbox.addWidget(self._preview_img, stretch=1)
+        vbox.addWidget(self._preview_name)
+        return panel
 
     def _build_summary_tab(self) -> QWidget:
         scroll = QScrollArea()
@@ -294,8 +403,51 @@ class MainWindow(QMainWindow):
         self._chart_iso.setHtml(charts.iso_chart(records))
         self._chart_cl.setHtml(charts.camera_lens_chart(records))
 
+    def _load_preview(self, path: Path) -> None:
+        if self._preview_worker is not None:
+            self._preview_worker.cancel()
+        self._preview_generation += 1
+        gen = self._preview_generation
+        self._preview_name.setText(path.name)
+        self._preview_img.clear_source()
+        self._preview_img.setText("Loading…")
+        worker = PreviewWorker(path)
+        worker.loaded.connect(lambda img, g=gen: self._on_preview_loaded(img, g))
+        worker.failed.connect(lambda msg, g=gen: self._on_preview_failed(msg, g))
+        worker.finished.connect(worker.deleteLater)
+        self._preview_worker = worker
+        worker.start()
+
+    def _clear_preview(self) -> None:
+        if self._preview_worker is not None:
+            self._preview_worker.cancel()
+            self._preview_worker = None
+        self._preview_img.clear_source()
+        self._preview_img.setText("")
+        self._preview_name.setText("Select a single image\nto preview")
+
+    def _on_preview_loaded(self, img: QImage, gen: int) -> None:
+        if gen != self._preview_generation:
+            return
+        self._preview_worker = None
+        self._preview_img.set_source(QPixmap.fromImage(img))
+
+    def _on_preview_failed(self, _msg: str, gen: int) -> None:
+        if gen != self._preview_generation:
+            return
+        self._preview_worker = None
+        self._preview_img.clear_source()
+        self._preview_img.setText("Preview unavailable")
+
     def _on_selection_changed(self) -> None:
         rows = self._table.selectionModel().selectedRows()
+
+        if len(rows) == 1:
+            path_str = self._table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+            self._load_preview(Path(path_str))
+        else:
+            self._clear_preview()
+
         if not rows:
             self._xmp_group.setVisible(False)
             return

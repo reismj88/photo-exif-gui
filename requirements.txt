@@ -2,3 +2,4 @@ PyQt6>=6.6.0
 PyQt6-WebEngine>=6.6.0
 plotly>=5.18.0
 exifread>=3.0.0
+rawpy>=0.18.0
