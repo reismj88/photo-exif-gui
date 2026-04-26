@@ -173,6 +173,7 @@ class MainWindow(QMainWindow):
         self._worker: ScanWorker | None = None
         self._preview_worker: PreviewWorker | None = None
         self._preview_generation: int = 0
+        self._running_workers: set[PreviewWorker] = set()
         self._setup_ui()
 
     # ------------------------------------------------------------------ setup
@@ -414,7 +415,10 @@ class MainWindow(QMainWindow):
         worker = PreviewWorker(path)
         worker.loaded.connect(lambda img, g=gen: self._on_preview_loaded(img, g))
         worker.failed.connect(lambda msg, g=gen: self._on_preview_failed(msg, g))
-        worker.finished.connect(worker.deleteLater)
+        # Keep worker in _running_workers until the thread exits so Python GC
+        # never destroys the QThread wrapper while the OS thread is still live.
+        worker.finished.connect(lambda w=worker: self._running_workers.discard(w))
+        self._running_workers.add(worker)
         self._preview_worker = worker
         worker.start()
 
